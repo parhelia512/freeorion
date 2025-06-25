@@ -1536,7 +1536,7 @@ SetSpecies::SetSpecies(std::unique_ptr<ValueRef::ValueRef<std::string>>&& specie
 {}
 
 void SetSpecies::Execute(ScriptingContext& context) const {
-    if (!context.effect_target)
+    if (!context.effect_target || !m_species_name)
         return;
 
     if (context.effect_target->ObjectType() == UniverseObjectType::OBJ_SHIP) {
@@ -1559,26 +1559,20 @@ void SetSpecies::Execute(ScriptingContext& context) const {
         auto& initial_focus = planet->Focus();
         auto available_foci = planet->AvailableFoci(context);
 
-        // leave current focus unchanged if available.
-        if (std::any_of(available_foci.begin(), available_foci.end(),
-                        [&initial_focus](const auto& af) { return initial_focus == af; }))
-        { return; }
+        // leave current focus unchanged, if available.
+        if (range_contains(available_foci, initial_focus))
+            return;
 
-        const Species* species = context.species.GetSpecies(planet->SpeciesName());
-        const auto default_focus = species ? std::string_view{species->DefaultFocus()} : "";
-
-        // chose default focus if available. otherwise use any available focus
-        bool default_available = false;
-        for (const auto& available_focus : available_foci) {
-            if (available_focus == default_focus) {
-                default_available = true;
-                break;
+        // chose default focus for species, if available.
+        if (const Species* species = context.species.GetSpecies(planet->SpeciesName())) {
+            if (range_contains(available_foci, species->DefaultFocus())) {
+                planet->SetFocus(species->DefaultFocus(), context);
+                return;
             }
         }
 
-        if (default_available)
-            planet->SetFocus(std::string{default_focus}, context);
-        else if (!available_foci.empty())
+        // otherwise use any available focus
+        if (!available_foci.empty())
             planet->SetFocus(std::string{available_foci.front()}, context);
     }
 }
@@ -2684,11 +2678,12 @@ AddStarlanes::AddStarlanes(std::unique_ptr<Condition::Condition>&& other_lane_en
 {}
 
 namespace {
-    constexpr auto not_null = [](const auto* o) -> bool { return o; };
+    constexpr auto not_null = [](const auto& o) noexcept -> bool { return static_cast<bool>(o); };
 }
 
 void AddStarlanes::Execute(ScriptingContext& context) const {
     const auto to_system = [&context](UniverseObject* o) -> System* {
+        if (!o) return nullptr;
         if (o->ObjectType() == UniverseObjectType::OBJ_SYSTEM)
             return static_cast<System*>(o);
         return context.ContextObjects().getRaw<System>(o->SystemID()); // may be nullptr
@@ -2712,11 +2707,8 @@ void AddStarlanes::Execute(ScriptingContext& context) const {
         return; // nothing to do!
 
     // get systems containing at least one endpoint object
-    std::vector<System*> endpoint_systems;
-    endpoint_systems.reserve(endpoint_objects.size());
-    auto end_sys_rng = endpoint_objects | range_filter(not_null)
-        | range_transform(to_system) | range_filter(not_null);
-    range_copy(end_sys_rng, std::back_inserter(endpoint_systems));
+    auto endpoint_systems = endpoint_objects | range_filter(not_null)
+        | range_transform(to_system) | range_filter(not_null) | range_to_vec;
 
     // ensure uniqueness of results
     std::sort(endpoint_systems.begin(), endpoint_systems.end());
@@ -2779,14 +2771,14 @@ void RemoveStarlanes::Execute(ScriptingContext& context) const {
     const auto endpoint_objects = m_other_lane_endpoint_condition->Eval(std::as_const(context));
 
     // get system IDs of those objects
-    std::vector<int> endpoint_system_ids;
-    endpoint_system_ids.reserve(endpoint_objects.size());
-    std::transform(endpoint_objects.begin(), endpoint_objects.end(), std::back_inserter(endpoint_system_ids),
-                   [](const auto* obj) { return obj ? obj->SystemID() : INVALID_OBJECT_ID; });
+    static constexpr auto to_sys_id = [](const auto* obj) { return obj ? obj->SystemID() : INVALID_OBJECT_ID; };
+    auto endpoint_system_ids = endpoint_objects | range_transform(to_sys_id) | range_to_vec;
+
     // uniquify
     std::sort(endpoint_system_ids.begin(), endpoint_system_ids.end());
     auto unique_it = std::unique(endpoint_system_ids.begin(), endpoint_system_ids.end());
     endpoint_system_ids.erase(unique_it, endpoint_system_ids.end());
+
     // get all those systems
     auto endpoint_systems = context.ContextObjects().findRaw<System>(endpoint_system_ids);
 
@@ -4101,11 +4093,9 @@ uint32_t GenerateSitRepMessage::GetCheckSum() const {
 
 std::vector<std::pair<std::string, const ValueRef::ValueRef<std::string>*>>
 GenerateSitRepMessage::MessageParameters() const {
-    std::vector<std::pair<std::string, const ValueRef::ValueRef<std::string>*>> retval;
-    retval.reserve(m_message_parameters.size());
-    std::transform(m_message_parameters.begin(), m_message_parameters.end(), std::back_inserter(retval),
-                   [](const auto& xx) { return std::pair(xx.first, xx.second.get()); });
-    return retval;
+    static constexpr auto massage = [](const auto& xx) -> std::pair<std::string, const ValueRef::ValueRef<std::string>*>
+    { return {xx.first, xx.second.get()}; };
+    return m_message_parameters | range_transform(massage) | range_to_vec;
 }
 
 std::unique_ptr<Effect> GenerateSitRepMessage::Clone() const {
@@ -4292,21 +4282,19 @@ void SetVisibility::Execute(ScriptingContext& context) const {
     }
 
     // what to set visibility of?
-    std::vector<int> object_ids;
-    if (!m_condition) {
-        object_ids.push_back(context.effect_target->ID());
-    } else {
-        // get target object IDs
-        Condition::ObjectSet condition_matches = m_condition->Eval(std::as_const(context));
-        object_ids.reserve(condition_matches.size());
-        std::transform(condition_matches.begin(), condition_matches.end(),
-                       std::back_inserter(object_ids),
-                       [](const auto* o) { return o->ID(); });
-        // ensure uniqueness
-        std::sort(object_ids.begin(), object_ids.end());
-        auto unique_it = std::unique(object_ids.begin(), object_ids.end());
-        object_ids.resize(std::distance(object_ids.begin(), unique_it));
-    }
+    const auto object_ids = m_condition ?
+        std::vector<int>{context.effect_target->ID()} :
+        [this, &context]() {
+            // get target object IDs
+            const Condition::ObjectSet condition_matches = m_condition->Eval(std::as_const(context));
+            static constexpr auto to_id = [](const auto* o) { return o ? o->ID() : INVALID_OBJECT_ID; };
+            auto object_ids = condition_matches | range_transform(to_id) | range_to_vec;
+            // ensure uniqueness
+            std::sort(object_ids.begin(), object_ids.end());
+            auto unique_it = std::unique(object_ids.begin(), object_ids.end());
+            object_ids.resize(std::distance(object_ids.begin(), unique_it));
+            return object_ids;
+        }();
 
     const int source_id = context.source ? context.source->ID() : INVALID_OBJECT_ID;
 
@@ -4415,23 +4403,19 @@ void Conditional::Execute(ScriptingContext& context, const TargetSet& targets) c
         return;
 
     // apply sub-condition to target set to pick which to act on with which of sub-effects
-    TargetSet matches{targets.begin(), targets.end()};
+    TargetSet matches(targets);
     TargetSet non_matches;
     non_matches.reserve(matches.size());
     if (m_target_condition)
         m_target_condition->Eval(context, matches, non_matches, Condition::SearchDomain::MATCHES);
 
     if (!matches.empty() && !m_true_effects.empty()) {
-        for (auto& effect : m_true_effects) {
-            if (effect)
-                effect->Execute(context, matches);
-        }
+        for (auto& effect : m_true_effects | range_filter(not_null))
+            effect->Execute(context, matches);
     }
     if (!non_matches.empty() && !m_false_effects.empty()) {
-        for (auto& effect : m_false_effects) {
-            if (effect)
-                effect->Execute(context, non_matches);
-        }
+        for (auto& effect : m_false_effects | range_filter(not_null))
+            effect->Execute(context, non_matches);
     }
 }
 
@@ -4447,7 +4431,7 @@ void Conditional::Execute(ScriptingContext& context,
     TraceLogger(effects) << "\n\nExecute Conditional effect: \n" << Dump();
 
     // apply sub-condition to target set to pick which to act on with which of sub-effects
-    TargetSet matches{targets.begin(), targets.end()};
+    TargetSet matches(targets);
     TargetSet non_matches;
     non_matches.reserve(matches.size());
 
